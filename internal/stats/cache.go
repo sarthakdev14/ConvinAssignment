@@ -35,8 +35,15 @@ func (c *Cache) Get(accountID string) AccountStats {
 	return *s
 }
 
-// Record folds one completed call into an account's running totals.
+// Record folds one completed call into an account's running totals. Safe for
+// concurrent use: the map lookup/insert and the counter update both happen
+// under the same write lock, so concurrent callers (including concurrent
+// first-time writes for a brand-new account) cannot race on the map or lose
+// updates to the counters.
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	s, ok := c.m[accountID]
 	if !ok {
 		s = &AccountStats{}
