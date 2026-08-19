@@ -7,8 +7,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrDuplicateEvent is returned by IngestEvent when the event_id has already
+// been stored. Callers should treat this as a successful no-op, not a
+// failure: the provider delivers at least once and redelivers even after a
+// 200, so seeing an event_id twice is expected, normal behavior.
+var ErrDuplicateEvent = errors.New("store: duplicate event_id")
 
 // Event is one call-completion webhook delivery.
 type Event struct {
@@ -26,6 +33,15 @@ type Event struct {
 type Stats struct {
 	CallCount        int64
 	TotalDurationSec int64
+}
+
+// PendingRecording identifies a call whose recording has not yet been
+// marked processed. Used to recover work left in flight by an interrupted
+// process (a restart/deploy, or a cancelled context).
+type PendingRecording struct {
+	CallID       string
+	AccountID    string
+	RecordingURL string
 }
 
 // Store is a Postgres-backed repository.
@@ -128,4 +144,88 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 		return Stats{}, err
 	}
 	return st, nil
+}
+
+// IngestEvent stores a delivery, upserts its call, and increments the
+// account's durable stats in a single transaction, so a mid-write failure
+// can never leave the event recorded as "seen" without its stats counted
+// (or vice versa).
+//
+// If event_id has already been stored, the unique constraint added in
+// migrations/002_unique_event_id.sql causes the insert to fail with
+// Postgres error code 23505; that failure is translated into
+// ErrDuplicateEvent and the transaction is rolled back cleanly, with no
+// partial writes. This is what makes concurrent redelivery of the same
+// event_id safe: whichever request loses the race gets ErrDuplicateEvent
+// instead of a generic error, and account_stats is only ever incremented
+// once per event_id, no matter how many requests race to insert it.
+func (s *Store) IngestEvent(ctx context.Context, e Event) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // no-op once Commit succeeds
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrDuplicateEvent
+		}
+		return err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// PendingRecordings lists calls that have a recording to process but have
+// not yet been marked processed. Used at startup to recover work that was
+// left in flight by an interrupted process — a restart/deploy, or a
+// recording goroutine whose context was cancelled before it finished.
+func (s *Store) PendingRecordings(ctx context.Context) ([]PendingRecording, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT call_id, account_id, recording_url FROM calls
+		 WHERE recording_url IS NOT NULL AND recording_url <> ''
+		   AND recording_processed = FALSE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PendingRecording
+	for rows.Next() {
+		var p PendingRecording
+		if err := rows.Scan(&p.CallID, &p.AccountID, &p.RecordingURL); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
