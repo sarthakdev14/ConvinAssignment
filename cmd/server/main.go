@@ -40,6 +40,17 @@ func main() {
 	defer func() { _ = rdb.Close() }()
 
 	svc := ingest.New(st, stats.NewCache(), rdb, log)
+
+	// Re-launch processing for any recording left unprocessed by an
+	// interrupted prior run (a restart/deploy, or a goroutine whose context
+	// was cancelled before it finished), before the server starts accepting
+	// new traffic. A failure here is logged rather than fatal: it just means
+	// those recordings stay pending until the next restart, which is no
+	// worse than today's behavior and not worth refusing to start over.
+	if err := svc.RecoverPendingRecordings(ctx); err != nil {
+		log.Error("recover pending recordings", "err", err)
+	}
+
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
 
 	go func() {
