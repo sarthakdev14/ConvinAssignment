@@ -4,6 +4,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -15,6 +16,14 @@ import (
 
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
+
+// recordingProcessingTimeout bounds how long background recording
+// processing may run. It is deliberately independent of the inbound
+// request's context: net/http cancels a request's context as soon as its
+// handler returns, which happens immediately after Ingest launches this
+// work - well before recordingWork would elapse - so tying this to the
+// request context would fail it on almost every delivery.
+const recordingProcessingTimeout = 30 * time.Second
 
 // Service ingests webhook deliveries.
 type Service struct {
@@ -36,16 +45,16 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
+//
+// Storage is atomic: the event insert, call upsert, and stats increment all
+// happen inside one transaction (store.IngestEvent). The provider delivers
+// at least once and redelivers even after a 200, so seeing an event_id
+// again - including two deliveries racing each other - is expected: it
+// comes back as store.ErrDuplicateEvent and is treated as a successful
+// no-op, never as a failure. The in-memory cache is only updated once we
+// know this delivery was the one that actually got stored, so a losing
+// duplicate can never double-count it.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,27 +70,36 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	if err := s.store.IngestEvent(ctx, rec); err != nil {
+		if errors.Is(err, store.ErrDuplicateEvent) {
+			s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+			return nil
+		}
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
-	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		s.processRecordingAsync(rec)
 	}
 
 	return nil
+}
+
+// processRecordingAsync runs processRecording in the background on a
+// context whose lifetime is independent of any inbound HTTP request, bounded
+// by recordingProcessingTimeout so a stuck fetch cannot run forever.
+// Failures are logged instead of being silently discarded.
+func (s *Service) processRecordingAsync(rec store.Event) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), recordingProcessingTimeout)
+		defer cancel()
+		if err := s.processRecording(ctx, rec); err != nil {
+			s.log.Error("process recording", "call_id", rec.CallID, "account_id", rec.AccountID, "err", err)
+		}
+	}()
 }
 
 // processRecording downloads and transcodes the call recording, then marks
@@ -89,4 +107,30 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	time.Sleep(recordingWork)
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+}
+
+// RecoverPendingRecordings re-launches processing for every call whose
+// recording was never marked processed - because a previous run was
+// interrupted (a restart/deploy), or because an earlier goroutine's context
+// was cancelled before it finished. Intended to run once at startup, before
+// the server begins accepting traffic, so nothing is silently lost across a
+// deploy.
+func (s *Service) RecoverPendingRecordings(ctx context.Context) error {
+	pending, err := s.store.PendingRecordings(ctx)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	s.log.Info("recovering pending recordings", "count", len(pending))
+	for _, p := range pending {
+		s.processRecordingAsync(store.Event{
+			CallID:       p.CallID,
+			AccountID:    p.AccountID,
+			RecordingURL: p.RecordingURL,
+		})
+	}
+	return nil
 }
